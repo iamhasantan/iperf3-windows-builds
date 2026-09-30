@@ -1,0 +1,298 @@
+name: Build latest iperf3 for Windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-release.yml"
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: iperf3-windows-release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+      upstream_release_date: ${{ steps.latest.outputs.upstream_release_date }}
+      should_build: ${{ steps.latest.outputs.should_build }}
+    steps:
+      - name: Detect latest upstream release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$(gh api repos/esnet/iperf/releases/latest)"
+          version="$(jq -r '.tag_name' <<<"$release_json")"
+          upstream_release_date="$(jq -r '.body' <<<"$release_json" | sed -n '1s/^iperf-[^ ]* //p' | tr -d '\r')"
+
+          if [[ -z "$upstream_release_date" ]]; then
+            upstream_release_date="$(jq -r '.published_at[0:10]' <<<"$release_json")"
+          fi
+
+          release_tag="windows-$version"
+
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true
+          else
+            release_exists=false
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$release_exists" == "true" ]]; then
+            should_build=false
+          else
+            should_build=true
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "upstream_release_date=$upstream_release_date" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream version: $version"
+          echo "Upstream release date: $upstream_release_date"
+          echo "Build required: $should_build"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      UPSTREAM_RELEASE_DATE: ${{ needs.detect.outputs.upstream_release_date }}
+    steps:
+      - name: Install Cygwin build toolchain
+        uses: cygwin/cygwin-install-action@v6
+        with:
+          install-dir: C:\cygwin64
+          platform: x86_64
+          packages: gcc-core make curl tar gzip zip python3
+
+      - name: Download and verify official ESnet source
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/iperf-build
+          cd /tmp/iperf-build
+
+          base_url="https://downloads.es.net/pub/iperf"
+          curl --fail --location "$base_url/iperf-$VERSION.tar.gz" -o "iperf-$VERSION.tar.gz"
+          curl --fail --location "$base_url/iperf-$VERSION.tar.gz.sha256" -o "iperf-$VERSION.tar.gz.sha256"
+
+          expected_sha="$(awk '{print $1}' "iperf-$VERSION.tar.gz.sha256" | tr -d '\r\n')"
+          actual_sha="$(sha256sum "iperf-$VERSION.tar.gz" | awk '{print $1}')"
+
+          echo "Expected SHA256: $expected_sha"
+          echo "Actual SHA256:   $actual_sha"
+          test "$actual_sha" = "$expected_sha"
+
+          tar -xzf "iperf-$VERSION.tar.gz"
+
+      - name: Stamp Windows build metadata
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          cd "/tmp/iperf-build/iperf-$VERSION"
+
+          build_date_utc="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          printf '%s\n' "$build_date_utc" > /tmp/iperf-build/build-date-utc.txt
+
+          sed -i "/#define IPERF_VERSION/a #define IPERF_WINDOWS_BUILD_DATE \"$build_date_utc\"" src/version.h.in
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/iperf_api.c")
+          lines = p.read_text().splitlines()
+
+          case_idx = next((i for i, line in enumerate(lines) if "case 'v':" in line), None)
+          if case_idx is None:
+              raise SystemExit("Could not locate case 'v' block")
+
+          printf_idx = next((i for i in range(case_idx, min(case_idx + 20, len(lines)))
+                             if 'printf("%s (cJSON %s)' in lines[i]), None)
+          if printf_idx is None:
+              raise SystemExit("Could not locate version printf")
+
+          end_idx = next((i for i in range(printf_idx, min(printf_idx + 10, len(lines)))
+                          if 'get_optional_features());' in lines[i]), None)
+          if end_idx is None:
+              raise SystemExit("Could not locate end of version printf")
+
+          indent = lines[printf_idx][:len(lines[printf_idx]) - len(lines[printf_idx].lstrip())]
+          replacement = [
+              indent + r'printf("%s (cJSON %s)\nWindows build: %s\n%s\n%s\n", version, cJSON_Version(),',
+              indent + r'       IPERF_WINDOWS_BUILD_DATE, get_system_info(), get_optional_features());',
+          ]
+
+          lines[printf_idx:end_idx + 1] = replacement
+          p.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Configure static-ish Windows build
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          cd "/tmp/iperf-build/iperf-$VERSION"
+
+          ./configure \
+            --disable-shared \
+            --enable-static \
+            --enable-static-bin \
+            --without-sctp
+
+      - name: Compile
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          cd "/tmp/iperf-build/iperf-$VERSION"
+          make -j"$(nproc)"
+
+      - name: Verify binary and dependencies
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          cd "/tmp/iperf-build/iperf-$VERSION"
+          ./src/iperf3.exe --version
+          echo
+          echo "Runtime dependencies:"
+          cygcheck ./src/iperf3.exe
+
+      - name: TCP parallel and JSON smoke test
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          cd "/tmp/iperf-build/iperf-$VERSION"
+
+          ./src/iperf3.exe -s -1 -p 55201 > server-upload.log 2>&1 &
+          server_pid=$!
+          sleep 2
+          ./src/iperf3.exe -c 127.0.0.1 -p 55201 -P 4 -t 2 -J > upload.json
+          wait "$server_pid"
+          grep -q '"end"' upload.json
+
+      - name: TCP reverse smoke test
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          cd "/tmp/iperf-build/iperf-$VERSION"
+
+          ./src/iperf3.exe -s -1 -p 55202 > server-reverse.log 2>&1 &
+          server_pid=$!
+          sleep 2
+          ./src/iperf3.exe -c 127.0.0.1 -p 55202 -R -t 2
+          wait "$server_pid"
+
+      - name: Package Windows build
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+
+          root="/tmp/iperf-build"
+          src="$root/iperf-$VERSION"
+          package_name="iperf3-$VERSION-windows-x86_64"
+          package_dir="$root/package/$package_name"
+
+          mkdir -p "$package_dir"
+          cp "$src/src/iperf3.exe" "$package_dir/"
+          cp "$src/LICENSE" "$package_dir/LICENSE.txt"
+
+          build_info="$("$src/src/iperf3.exe" --version 2>&1)"
+          build_date_utc="$(cat "$root/build-date-utc.txt")"
+
+          cygcheck "$src/src/iperf3.exe" \
+            | grep -oE 'C:\\cygwin64\\bin\\[^ ]+\.dll' \
+            | sort -u \
+            | while IFS= read -r dll; do
+                unix_path="$(cygpath -u "$dll")"
+                echo "Including runtime dependency: $unix_path"
+                cp -n "$unix_path" "$package_dir/"
+              done
+
+          printf '%s\n' \
+            "iperf3 $VERSION for Windows x86_64" \
+            "" \
+            "Unofficial community build of ESnet iperf3." \
+            "Built from the official ESnet source tarball after SHA256 verification." \
+            "" \
+            "Upstream release: iperf-$VERSION" \
+            "Upstream release date: $UPSTREAM_RELEASE_DATE" \
+            "Upstream: https://github.com/esnet/iperf" \
+            "Source: https://downloads.es.net/pub/iperf/iperf-$VERSION.tar.gz" \
+            "" \
+            "Windows is not an officially supported iperf3 platform." \
+            "" \
+            "Build date (UTC): $build_date_utc" \
+            "" \
+            "Build information:" \
+            "$build_info" \
+            > "$package_dir/README.txt"
+
+          cd "$root/package"
+          zip -9 -r "$package_name.zip" "$package_name"
+          sha256sum "$package_name.zip" > "$package_name.zip.sha256"
+
+      - name: Create release notes
+        shell: pwsh
+        run: |
+          @"
+          ## iperf3 $env:VERSION for Windows x86_64
+
+          Unofficial community Windows build of ESnet iperf3.
+
+          Upstream release: iperf-$env:VERSION
+          Upstream release date: $env:UPSTREAM_RELEASE_DATE
+
+          Build checks:
+          - official ESnet source tarball
+          - official SHA256 verified before compilation
+          - static iperf/libiperf linking where supported by Cygwin
+          - Windows build timestamp embedded in iperf3 -v
+          - iperf3 --version validation
+          - parallel TCP test
+          - JSON output test
+          - reverse TCP test
+          - required Cygwin runtime DLLs bundled
+          - release ZIP SHA256 included
+
+          Windows is not an officially supported iperf3 platform.
+
+          Upstream: https://github.com/esnet/iperf
+          Source: https://downloads.es.net/pub/iperf/iperf-$env:VERSION.tar.gz
+          "@ | Set-Content release-notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $Package = "iperf3-$env:VERSION-windows-x86_64"
+          $Tag = "windows-$env:VERSION"
+          $Zip = "C:\cygwin64\tmp\iperf-build\package\$Package.zip"
+          $Sha = "C:\cygwin64\tmp\iperf-build\package\$Package.zip.sha256"
+
+          gh release view $Tag --repo "${{ github.repository }}" *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $Tag `
+              --repo "${{ github.repository }}" `
+              --title "iperf3 $env:VERSION for Windows x86_64" `
+              --notes-file "release-notes.md"
+
+            gh release upload $Tag $Zip $Sha `
+              --repo "${{ github.repository }}" `
+              --clobber
+          }
+          else {
+            gh release create $Tag $Zip $Sha `
+              --repo "${{ github.repository }}" `
+              --title "iperf3 $env:VERSION for Windows x86_64" `
+              --notes-file "release-notes.md"
+          }
