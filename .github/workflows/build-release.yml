@@ -153,10 +153,12 @@ jobs:
           set -euo pipefail
           cd "/tmp/iperf-build/iperf-$VERSION"
 
+          # Cygwin needs its runtime DLL. Upstream --enable-static-bin adds
+          # --static to LDFLAGS, which makes even configure's link check fail.
+          # Keep libiperf static while packaging Cygwin runtime dependencies.
           if ! ./configure \
             --disable-shared \
             --enable-static \
-            --enable-static-bin \
             --without-sctp; then
             echo "Autoconf configuration failed. Last 200 lines of config.log:"
             if [[ -f config.log ]]; then
