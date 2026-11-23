@@ -63,7 +63,7 @@ jobs:
   build:
     needs: detect
     if: needs.detect.outputs.should_build == 'true'
-    runs-on: windows-latest
+    runs-on: windows-2022
     env:
       VERSION: ${{ needs.detect.outputs.version }}
       UPSTREAM_RELEASE_DATE: ${{ needs.detect.outputs.upstream_release_date }}
@@ -73,7 +73,18 @@ jobs:
         with:
           install-dir: C:\cygwin64
           platform: x86_64
-          packages: gcc-core make curl tar gzip zip python3
+          packages: gcc-core binutils make curl tar gzip zip python3
+
+      - name: Verify Cygwin compiler toolchain
+        shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
+        run: |
+          set -euo pipefail
+          command -v gcc
+          command -v ld
+          gcc --version
+          printf 'int main(void) { return 0; }\n' > /tmp/iperf-compiler-smoke.c
+          gcc -v /tmp/iperf-compiler-smoke.c -o /tmp/iperf-compiler-smoke.exe
+          /tmp/iperf-compiler-smoke.exe
 
       - name: Download and verify official ESnet source
         shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
@@ -142,11 +153,17 @@ jobs:
           set -euo pipefail
           cd "/tmp/iperf-build/iperf-$VERSION"
 
-          ./configure \
+          if ! ./configure \
             --disable-shared \
             --enable-static \
             --enable-static-bin \
-            --without-sctp
+            --without-sctp; then
+            echo "Autoconf configuration failed. Last 200 lines of config.log:"
+            if [[ -f config.log ]]; then
+              tail -n 200 config.log
+            fi
+            exit 1
+          fi
 
       - name: Compile
         shell: C:\cygwin64\bin\bash.exe --noprofile --norc -e -o igncr -o pipefail {0}
